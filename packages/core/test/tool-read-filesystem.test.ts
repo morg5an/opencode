@@ -439,6 +439,47 @@ describe("ReadToolFileSystem", () => {
     }),
   )
 
+  it.effect("reads the end of a file whose lines are longer than a chunk", () =>
+    Effect.gen(function* () {
+      const { environment, files, directory } = yield* fixture
+      const read = (name: string, content: string | Uint8Array, page: ReadToolFileSystem.PageInput) =>
+        (typeof content === "string"
+          ? files.writeFileString(path.join(directory, name), content)
+          : files.writeFile(path.join(directory, name), content)
+        ).pipe(
+          Effect.andThen(ReadToolFileSystem.read(environment, absolute(path.join(directory, name)), name, page)),
+          Effect.map((result) => String(ReadTool.toModelContent(name, page.offset, result)).split("\n")),
+        )
+      const clamped = (line: string) => `${line.slice(0, 2_000)}... (line truncated to 2000 chars)`
+      // Lines of 600 KB, in characters of 1 to 4 bytes, each cut from the window after its first 8000 bytes.
+      const lines = ["a", "é", "€", "😀"].map((character, index) => `${index + 1}${character.repeat(600_000 / 4)}`)
+      const content = lines.join("\r\n")
+
+      expect(yield* read("negative.txt", content, { offset: -2 })).toEqual([
+        "Read file negative.txt, lines 3-4",
+        `3: ${clamped(lines[2])}`,
+        `4: ${clamped(lines[3])}`,
+      ])
+      expect(yield* read("past.txt", content, { offset: 9 })).toEqual([
+        "Read file past.txt, lines 1-4 (offset 9 is past the end; the file has 4 lines)",
+        ...lines.map((line, index) => `${index + 1}: ${clamped(line)}`),
+      ])
+      expect(yield* read("deep.txt", content, { offset: 2, limit: 1 })).toEqual([
+        "Read file deep.txt, lines 2-2",
+        `2: ${clamped(lines[1])}`,
+        "[Output truncated. Continue reading with offset: 3]",
+      ])
+
+      // A null byte in the cut part of a line still marks the file as binary.
+      const single = new TextEncoder().encode(`${"z".repeat(1_000_000)}\n${"y".repeat(1_000_000)}`)
+      single[500_000] = 0
+      const negative = yield* read("cut-nul.txt", single, { offset: -1 }).pipe(Effect.flip)
+      expect(negative).toBeInstanceOf(ReadToolFileSystem.BinaryFileError)
+      const past = yield* read("cut-nul-past.txt", single, { offset: 3 }).pipe(Effect.flip)
+      expect(past).toBeInstanceOf(ReadToolFileSystem.BinaryFileError)
+    }),
+  )
+
   it.effect("rejects a negative offset for a directory", () =>
     Effect.gen(function* () {
       const { environment, files, directory } = yield* fixture

@@ -168,8 +168,8 @@ export const read = Effect.fn("ReadTool.read")(function* (
   return yield* streamPage(files, input, resource, first, page)
 })
 
-// Streams a file larger than the first chunk, keeping only the chunks the page can still need: chunks from the
-// start of the requested line, or the last lines of the file while the page may turn out to be its tail.
+// Streams a file larger than the first chunk, keeping only what the page can still need: the chunks from the start of
+// the requested line on, or the file's last lines while the page may turn out to be its tail.
 const streamPage = Effect.fnUntraced(function* (
   files: Files,
   input: AbsolutePath,
@@ -182,19 +182,48 @@ const streamPage = Effect.fnUntraced(function* (
   // Lines counted back from the end that the window keeps: a negative offset's start, or the tail returned for an
   // offset past the end.
   const tail = offset < 0 ? Math.min(-offset, MAX_READ_LINES) : Math.min(page.limit || TAIL_LINES, TAIL_LINES)
-  const window: Chunk[] = [chunk(first.bytes)]
-  // Newlines and bytes in the dropped chunks.
+  const window: Chunk[] = []
+  // What the window no longer holds: the newlines of the chunks it dropped, whether there were any, and whether they
+  // had a NUL byte.
   let before = 0
-  let dropped = 0
+  let dropped = false
   let binaryBefore = false
-  // Whether the window holds the start of the line after newline `newline` of the file.
-  const holds = (newline: number) => newline > before || (newline === 0 && dropped === 0)
-  let bytes = first.bytes.length
-  let lines = window[0].lines
-  let last = first.bytes.at(-1)
+  // Whether the window holds the start of the line after the file's `newline`th newline.
+  const holds = (newline: number) => newline > before || (newline === 0 && !dropped)
+  let size = 0
+  let lines = 0
+  let run = 0
+  let read = 0
+  let last: number | undefined
   let ended = false
+  let next = first.bytes
   while (true) {
-    const eof = ended || bytes >= first.info.size
+    if (next.length === 0) ended = true
+    else {
+      const item = clip(next, run)
+      read += next.length
+      last = next.at(-1)
+      lines += item.lines
+      run = item.run
+      if (item.bytes.length > 0) {
+        window.push(item)
+        size += item.bytes.length
+      }
+      // Drop the oldest chunk while it ends before the requested line and the rest still hold the tail lines.
+      while (
+        window.length > 1 &&
+        (offset < 0 || before + window[0].lines < offset - 1) &&
+        lines - before - window[0].lines > tail
+      ) {
+        const oldest = window.shift()!
+        before += oldest.lines
+        size -= oldest.bytes.length
+        dropped = true
+        binaryBefore ||= oldest.bytes.includes(0)
+      }
+    }
+
+    const eof = ended || read >= first.info.size
     const total = lineCount(lines, last)
     if (eof && offset > total) {
       const skipped = Math.max(0, total - tail)
@@ -202,7 +231,7 @@ const streamPage = Effect.fnUntraced(function* (
       // Decode from the newline ending the last skipped line, so a byte order mark
       // starting the tail stays content. That empty first line is never in the tail.
       const result = textPage(
-        windowSlice(window, Math.max(0, windowOffset(window, skipped - before) - 1)),
+        windowSlice(window, Math.max(0, windowOffset(window, skipped - before) - 1), size),
         true,
         page,
       )
@@ -217,42 +246,24 @@ const streamPage = Effect.fnUntraced(function* (
     if (eof || (offset > 0 && lines >= offset - 1)) {
       // A negative offset only resolves at EOF, counting back from the last line.
       const from = offset < 0 ? Math.max(1, total + offset + 1) : offset
-      // A negative offset reaching further back than the window keeps reads from the start like a positive one.
+      // A negative offset reaching further back than the window reads from the start like a positive one.
       if (!holds(from - 1)) return yield* streamPage(files, input, resource, first, { ...page, offset: from })
       const start = windowOffset(window, from - 1 - before)
-      const result = textPage(windowSlice(window, start), eof, { limit })
+      // Decode only the requested lines plus one byte, enough to tell whether more follow.
+      const end = Math.min(size, windowOffset(window, from - 1 - before + limit) + 1)
+      const result = textPage(windowSlice(window, start, end), eof && end === size, { limit })
       if (result !== undefined) {
         const translated = {
           ...result,
           offset: from,
           ...(result.next === undefined ? { next: undefined } : { next: from + result.next - 1 }),
         }
-        const binary = binaryBefore || windowSlice(window, 0, start + result.consumed).includes(0)
+        const binary = binaryBefore || windowHasNul(window, start + result.consumed)
         return yield* makeTextPage(input, resource, translated, binary)
       }
     }
 
-    const next = yield* readFile(files, input, resource, { offset: bytes, length: FIRST_CHUNK })
-    if (next.bytes.length === 0) {
-      ended = true
-      continue
-    }
-    const item = chunk(next.bytes)
-    window.push(item)
-    bytes += item.bytes.length
-    lines += item.lines
-    last = item.bytes.at(-1)
-    // Drop the oldest chunk while it ends before the requested line and the rest still hold the tail lines.
-    while (
-      window.length > 1 &&
-      (offset < 0 || before + window[0].lines < offset - 1) &&
-      lines - before - window[0].lines > tail
-    ) {
-      const oldest = window.shift()!
-      before += oldest.lines
-      dropped += oldest.bytes.length
-      binaryBefore ||= oldest.bytes.includes(0)
-    }
+    next = (yield* readFile(files, input, resource, { offset: read, length: FIRST_CHUNK })).bytes
   }
 })
 
@@ -387,7 +398,41 @@ const lineCount = (newlines: number, last: number | undefined) => newlines + (la
 
 type Chunk = { readonly bytes: Uint8Array; readonly lines: number }
 
-const chunk = (bytes: Uint8Array): Chunk => ({ bytes, lines: countNewlines(bytes) })
+// A line is shown cut to MAX_LINE_LENGTH UTF-16 code units, none of which takes more than 3 bytes of UTF-8. Keeping 4
+// bytes for each still shows a longer line exactly, with room for a character cut at the end.
+const LINE_BYTES = MAX_LINE_LENGTH * 4
+const NUL = new Uint8Array([0])
+
+/**
+ * Counts the newlines in `bytes` and keeps at most LINE_BYTES of each line, given `run` bytes of its first line kept
+ * already. A NUL byte in a cut part is kept as one, so the binary check still sees it.
+ */
+const clip = (bytes: Uint8Array, run: number) => {
+  const kept: Uint8Array[] = []
+  let lines = 0
+  let copied = 0
+  let start = 0
+  let length = run
+  while (true) {
+    const newline = bytes.indexOf(10, start)
+    const end = newline === -1 ? bytes.length : newline
+    const room = Math.max(0, LINE_BYTES - length)
+    if (end - start > room) {
+      kept.push(bytes.subarray(copied, start + room))
+      if (bytes.subarray(start + room, end).includes(0)) kept.push(NUL)
+      copied = end
+    }
+    if (newline === -1)
+      return {
+        bytes: kept.length === 0 ? bytes : Buffer.concat([...kept, bytes.subarray(copied)]),
+        lines,
+        run: length + Math.min(end - start, room),
+      }
+    lines++
+    length = 0
+    start = newline + 1
+  }
+}
 
 const countNewlines = (bytes: Uint8Array) => {
   let count = 0
@@ -408,7 +453,7 @@ const windowOffset = (window: ReadonlyArray<Chunk>, newline: number) => {
   return offset
 }
 
-const windowSlice = (window: ReadonlyArray<Chunk>, start: number, end = Infinity) => {
+const windowSlice = (window: ReadonlyArray<Chunk>, start: number, end: number) => {
   let position = 0
   return Buffer.concat(
     window.flatMap((item) => {
@@ -418,6 +463,16 @@ const windowSlice = (window: ReadonlyArray<Chunk>, start: number, end = Infinity
       return [item.bytes.subarray(Math.max(0, start - itemStart), end - itemStart)]
     }),
   )
+}
+
+// Whether the window's first `end` bytes include a NUL byte.
+const windowHasNul = (window: ReadonlyArray<Chunk>, end: number) => {
+  let position = 0
+  return window.some((item) => {
+    const found = position < end && item.bytes.subarray(0, end - position).includes(0)
+    position += item.bytes.length
+    return found
+  })
 }
 
 const nthNewline = (bytes: Uint8Array, count: number) => {

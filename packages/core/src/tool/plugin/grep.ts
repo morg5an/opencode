@@ -9,6 +9,7 @@ import { FileSystem } from "../../filesystem.js"
 import { Location } from "../../location.js"
 import { FileAccess } from "../../file-access.js"
 import { Permission } from "../../permission.js"
+import { PermissionOperation } from "../../permission/operation.js"
 import { Ripgrep } from "../../ripgrep.js"
 import { RelativePath } from "../../schema.js"
 import { ToolSearch } from "../search.js"
@@ -70,6 +71,7 @@ export const Plugin = {
     const location = yield* Location.Service
     const access = yield* FileAccess.Service
     const permission = yield* Permission.Service
+    const operations = yield* PermissionOperation.Service
 
     yield* ctx.tool
       .transform((editor) =>
@@ -83,21 +85,41 @@ export const Plugin = {
           execute: (input, context) =>
             Effect.gen(function* () {
               const target = yield* access.resolve({ path: input.path ?? "." })
-              yield* access.authorizeExternal([target], context)
-              yield* permission.assert({
-                action: name,
-                resources: [input.pattern],
-                save: ["*"],
-                metadata: {
-                  root: ".",
-                  path: input.path,
-                  include: input.include,
-                  literal: input.literal,
-                  caseSensitive: input.caseSensitive,
-                  limit: input.limit,
-                },
-                ...Permission.invocation(context),
-              })
+              const episode = yield* operations.prepare(
+                { kind: "file-search", action: "grep", root: target.absolute, pattern: input.pattern },
+                context,
+              )
+              if (episode) {
+                yield* operations.authorizeBoundary(episode)
+                yield* operations.authorizeEffectProjected(episode, (projection) => {
+                  const projected = projection.targets[0]
+                  if (!projected) throw new Error("Grep root is outside native operation")
+                  return {
+                    root: ".",
+                    path: projection.target ? input.path : projected.absolute,
+                    include: input.include,
+                    literal: input.literal,
+                    caseSensitive: input.caseSensitive,
+                    limit: input.limit,
+                  }
+                })
+              } else {
+                yield* access.authorizeExternal([target], context)
+                yield* permission.assert({
+                  action: name,
+                  resources: [input.pattern],
+                  save: ["*"],
+                  metadata: {
+                    root: ".",
+                    path: input.path,
+                    include: input.include,
+                    literal: input.literal,
+                    caseSensitive: input.caseSensitive,
+                    limit: input.limit,
+                  },
+                  ...Permission.invocation(context),
+                })
+              }
               const root = target.absolute
               const type = yield* ToolSearch.pathType(environment.files, root, input.path ?? ".")
               const cwd = type === "directory" ? root : path.dirname(root)
@@ -125,6 +147,7 @@ export const Plugin = {
                 truncated: result.truncated,
               }
             }).pipe(
+              Effect.scoped,
               Effect.map((result) => ({
                 output: result.matches,
                 content: toModelContent(

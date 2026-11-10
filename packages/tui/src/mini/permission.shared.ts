@@ -1,5 +1,10 @@
 import type { MiniPermissionRequest, PermissionReply } from "./types"
-import { permissionAlwaysLines, permissionOptionLabel, permissionPresentation } from "../util/permission"
+import {
+  permissionAlwaysLines,
+  permissionDelegationLines,
+  permissionOptionLabel,
+  permissionPresentation,
+} from "../util/permission"
 import { toolPath } from "./tool"
 import { monoPrefix } from "./mono"
 
@@ -46,8 +51,8 @@ export function permissionOptions(stage: PermissionStage): PermissionOption[] {
 }
 
 export function permissionInfo(request: MiniPermissionRequest, directory?: string, mono = false) {
-  const state = request.tool?.state
-  const info = permissionPresentation(
+  const state = request.experimental?.delegation ? undefined : request.tool?.state
+  const presentation = permissionPresentation(
     {
       action: request.action,
       resources: request.resources,
@@ -57,6 +62,7 @@ export function permissionInfo(request: MiniPermissionRequest, directory?: strin
     },
     (value) => toolPath(value, { home: true, directory }),
   )
+  const info = { ...presentation, lines: [...permissionDelegationLines(request), ...presentation.lines] }
   if (!mono) return info
   return {
     ...info,

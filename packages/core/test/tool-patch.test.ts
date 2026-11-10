@@ -11,6 +11,7 @@ import { Location } from "@opencode/core/location"
 import { FileAccess } from "@opencode/core/file-access"
 import { Model } from "@opencode/core/model"
 import { Permission } from "@opencode/core/permission"
+import { PermissionOperation } from "@opencode/core/permission/operation"
 import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
@@ -47,6 +48,7 @@ const patchToolNode = makeLocationNode({
     Formatter.node,
     Location.node,
     Permission.node,
+    PermissionOperation.node,
   ],
 })
 

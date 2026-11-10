@@ -7,7 +7,12 @@ import type { PermissionReply, PermissionRequest } from "@opencode/client"
 import { SplitBorder } from "../../ui/border"
 import { useData } from "../../context/data"
 import { filetype } from "../../util/filetype"
-import { permissionAlwaysLines, permissionOptionLabel, permissionPresentation } from "../../util/permission"
+import {
+  permissionAlwaysLines,
+  permissionDelegationLines,
+  permissionOptionLabel,
+  permissionPresentation,
+} from "../../util/permission"
 import { getScrollAcceleration } from "../../util/scroll"
 import { useConfig, useCursorStyle } from "../../config"
 import { Keymap } from "../../context/keymap"
@@ -120,6 +125,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
   const session = createMemo(() => data.session.get(props.request.sessionID))
 
   const source = createMemo(() => {
+    if (props.request.experimental?.delegation) return { input: undefined, metadata: undefined }
     const tool = props.request.source
     if (!tool) return { input: undefined, metadata: undefined }
     const message = data.session.message.get(props.request.sessionID, tool.messageID)
@@ -203,6 +209,9 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
                 <text fg={theme.text.feedback.warning.base}>{"△"}</text>
                 <text fg={theme.text.base}>Permission required</text>
               </box>
+              <For each={permissionDelegationLines(props.request)}>
+                {(line) => <text fg={theme.text.muted}>{line}</text>}
+              </For>
               <Show when={props.request.action !== "shell" && current.title}>
                 <box flexDirection="row" gap={1} paddingLeft={2} flexShrink={0}>
                   <text fg={theme.text.muted} flexShrink={0}>

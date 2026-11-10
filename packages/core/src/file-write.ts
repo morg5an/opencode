@@ -9,6 +9,7 @@ import { FileAccess } from "./file-access.js"
 import { FileMutation } from "./file-mutation.js"
 import { Formatter } from "./formatter.js"
 import { Permission } from "./permission.js"
+import { PermissionOperation } from "./permission/operation.js"
 import type { SessionErrors } from "./session/error.js"
 import { fileDiff } from "./tool/plugin/file-diff.js"
 
@@ -43,10 +44,7 @@ export interface Interface {
   readonly write: (
     input: WriteInput,
     context: FileAccess.Invocation,
-  ) => Effect.Effect<
-    Written,
-    Environment.NotFound | Environment.WrongKind | Environment.Failed | Permission.Error | SessionErrors.NotFoundError
-  >
+  ) => Effect.Effect<Written, Environment.NotFound | Environment.WrongKind | PermissionOperation.Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/FileWrite") {}
@@ -59,6 +57,7 @@ const layer = Layer.effect(
     const fileMutation = yield* FileMutation.Service
     const formatter = yield* Formatter.Service
     const permission = yield* Permission.Service
+    const operations = yield* PermissionOperation.Service
 
     const target = Effect.fn("FileWrite.target")(function* (file: string, context: FileAccess.Invocation) {
       const target = yield* access.resolve({ path: file, kind: "file" })
@@ -89,16 +88,45 @@ const layer = Layer.effect(
       } satisfies Written
     })
 
-    const write = Effect.fn("FileWrite.write")(function* (input: WriteInput, context: FileAccess.Invocation) {
-      const resolved = yield* target(input.path, context)
-      const current = yield* FileMutation.readOptionalText(environment.files, resolved.absolute)
-      yield* authorize(
-        resolved,
-        context,
-        fileDiff(resolved.resource, current?.text ?? "", Bom.split(input.content).text, current ? "modified" : "added"),
-      )
-      return yield* commit(resolved, input.content)
-    })
+    const write = Effect.fn("FileWrite.write")((input: WriteInput, context: FileAccess.Invocation) =>
+      Effect.gen(function* () {
+        const resolved = yield* access.resolve({ path: input.path, kind: "file" })
+        const episode = yield* operations.prepare(
+          { kind: "file-path", action: "edit", targets: [{ absolute: resolved.absolute, kind: "file" }] },
+          context,
+        )
+        if (episode) yield* operations.authorizeBoundary(episode)
+        else yield* access.authorizeExternal([resolved], context)
+        const current = yield* FileMutation.readOptionalText(environment.files, resolved.absolute)
+        if (episode)
+          yield* operations.authorizeEffectProjected(episode, (projection) => {
+            const projected = projection.targets[0]
+            if (!projected) throw new Error("Write preview is outside native operation")
+            return {
+              files: [
+                fileDiff(
+                  projected.resource,
+                  current?.text ?? "",
+                  Bom.split(input.content).text,
+                  current ? "modified" : "added",
+                ),
+              ],
+            }
+          })
+        else
+          yield* authorize(
+            resolved,
+            context,
+            fileDiff(
+              resolved.resource,
+              current?.text ?? "",
+              Bom.split(input.content).text,
+              current ? "modified" : "added",
+            ),
+          )
+        return yield* commit(resolved, input.content)
+      }).pipe(Effect.scoped),
+    )
 
     return Service.of({ target, authorize, commit, write })
   }),
@@ -107,5 +135,12 @@ const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Environment.node, FileAccess.node, FileMutation.node, Formatter.node, Permission.node],
+  deps: [
+    Environment.node,
+    FileAccess.node,
+    FileMutation.node,
+    Formatter.node,
+    Permission.node,
+    PermissionOperation.node,
+  ],
 })

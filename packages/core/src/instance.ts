@@ -26,6 +26,8 @@ import { Integration } from "./integration.js"
 import { Location } from "./location.js"
 import { LocationLifecycle } from "./location-lifecycle.js"
 import { FileAccess } from "./file-access.js"
+import { FileAccessResolve } from "./file-access-resolve.js"
+import { PermissionOperation } from "./permission/operation.js"
 import { ModelResolver } from "./model-resolver.js"
 import { Mcp } from "./mcp/index.js"
 import { Permission } from "./permission.js"
@@ -93,6 +95,8 @@ const nodes = [
   InstructionBuiltIns.node,
   InstructionDiscovery.node,
   FileAccess.node,
+  FileAccessResolve.node,
+  PermissionOperation.node,
   FileMutation.node,
   FileWrite.node,
   Formatter.node,

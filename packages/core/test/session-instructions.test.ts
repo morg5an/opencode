@@ -16,6 +16,7 @@ import { FileAccess } from "@opencode/core/file-access"
 import { Environment } from "@opencode/core/environment/index"
 import { Model } from "@opencode/core/model"
 import { Permission } from "@opencode/core/permission"
+import { PermissionOperation } from "@opencode/core/permission/operation"
 import { Project } from "@opencode/core/project"
 import { Provider } from "@opencode/core/provider"
 import { ReadTool } from "@opencode/core/tool/plugin/read"
@@ -48,6 +49,7 @@ const readToolNode = makeLocationNode({
     FileAccess.node,
     Image.node,
     Permission.node,
+    PermissionOperation.node,
     SessionInstructions.node,
     Skill.node,
     FSUtil.node,

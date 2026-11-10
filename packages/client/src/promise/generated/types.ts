@@ -795,15 +795,11 @@ export type Project = {
   sandboxes: Array<string>
 }
 
-export type PermissionRequest = {
-  id: PermissionID
-  sessionID: SessionID
-  action: string
-  resources: Array<string>
-  save?: Array<string>
-  metadata?: { [x: string]: JsonValue }
+export type PermissionDelegation = {
+  operationID: string
+  targetSessionID: SessionID
+  targetDirectory: AbsolutePath
   source?: PermissionSource
-  message?: string
 }
 
 export type PermissionSavedInfo = {
@@ -1798,24 +1794,6 @@ export type ReferenceUpdated = {
   data: {}
 }
 
-export type PermissionAsked = {
-  id: EventID
-  created: number
-  metadata?: { [x: string]: any }
-  type: "permission.asked"
-  location?: LocationRef
-  data: {
-    id: PermissionID
-    sessionID: SessionID
-    action: string
-    resources: Array<string>
-    save?: Array<string>
-    metadata?: { [x: string]: any }
-    source?: PermissionSource
-    message?: string
-  }
-}
-
 export type PermissionReplied = {
   id: EventID
   created: number
@@ -2167,6 +2145,37 @@ export type VoiceSessionResponse = { data: { transport: VoiceTransport } }
 export type CredentialValue = CredentialOAuth | CredentialKey | CredentialExternal
 
 export type ConnectionInfo = ConnectionCredentialInfo | ConnectionEnvInfo
+
+export type PermissionRequest = {
+  id: PermissionID
+  sessionID: SessionID
+  action: string
+  resources: Array<string>
+  save?: Array<string>
+  metadata?: { [x: string]: JsonValue }
+  source?: PermissionSource
+  message?: string
+  experimental?: { delegation?: PermissionDelegation }
+}
+
+export type PermissionAsked = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "permission.asked"
+  location?: LocationRef
+  data: {
+    id: PermissionID
+    sessionID: SessionID
+    action: string
+    resources: Array<string>
+    save?: Array<string>
+    metadata?: { [x: string]: any }
+    source?: PermissionSource
+    message?: string
+    experimental?: { delegation?: PermissionDelegation }
+  }
+}
 
 export type PtyCreated = {
   id: EventID

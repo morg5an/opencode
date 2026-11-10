@@ -13,6 +13,8 @@ import { SessionStore } from "./session/store.js"
 import { Wildcard } from "./util/wildcard.js"
 import { PermissionSaved } from "./permission/saved.js"
 import { PluginHooks } from "./plugin/hooks.js"
+import { AuthorityInput } from "@opencode/plugin/permission"
+import { PermissionOperationContext } from "./permission/operation-context.js"
 
 const PermissionEffect = Permission.Effect
 export { PermissionEffect as Effect }
@@ -31,7 +33,7 @@ export type Request = typeof Request.Type
 export const Reply = Permission.Reply
 export type Reply = typeof Reply.Type
 
-export interface AssertInput extends Omit<Request, "id" | "message"> {
+export interface AssertInput extends Omit<Request, "id" | "message" | "experimental"> {
   readonly id?: ID
   readonly agent?: Agent.ID
 }
@@ -52,6 +54,20 @@ export interface ReplyInput {
 export interface AskResult {
   readonly id: ID
   readonly effect: Permission.Effect
+}
+
+export interface Decision {
+  readonly effect: Permission.Effect
+  readonly message?: string
+  readonly authorities: ReadonlyArray<SessionSchema.ID>
+  readonly revision: string
+}
+
+interface Evaluation {
+  readonly effect: Permission.Effect
+  readonly rules: Permission.Ruleset
+  readonly agentID?: Agent.ID
+  readonly message?: string
 }
 
 export { Event } from "@opencode/schema/permission"
@@ -108,6 +124,10 @@ export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
 }
 
 export interface Interface {
+  readonly collect: (input: AssertInput) => Effect.Effect<ReadonlyArray<SessionSchema.ID>>
+  readonly configuredDenies: (input: AssertInput) => Effect.Effect<boolean, SessionErrors.NotFoundError>
+  readonly inspect: (input: AssertInput) => Effect.Effect<Decision, SessionErrors.NotFoundError>
+  readonly settle: (decision: Decision) => Effect.Effect<void, Error | SessionErrors.NotFoundError>
   readonly close: Effect.Effect<void>
   readonly ask: (input: AssertInput) => Effect.Effect<AskResult, SessionErrors.NotFoundError>
   readonly assert: (input: AssertInput) => Effect.Effect<void, Error | SessionErrors.NotFoundError>
@@ -170,7 +190,10 @@ const layer = Layer.effect(
       const session = yield* sessions.get(sessionID)
       if (!session) return yield* new SessionErrors.NotFoundError({ sessionID })
       const agent = yield* agents.resolve(agentID ?? session.agent)
-      return merge(agent?.permissions ?? missingAgentPermissions, session.permissions ?? [])
+      return {
+        agentID: agent?.id,
+        rules: merge(agent?.permissions ?? missingAgentPermissions, session.permissions ?? []),
+      }
     })
 
     function denied(input: Pick<Request, "action" | "resources">, rules: Permission.Ruleset) {
@@ -181,35 +204,87 @@ const layer = Layer.effect(
       return rules.filter((rule) => Wildcard.match(input.action, rule.action))
     }
 
-    const evaluateInput = Effect.fnUntraced(function* (input: AssertInput) {
-      const rules = yield* configured(input.sessionID, input.agent)
-      if (denied(input, rules)) return { effect: "deny" as const, rules }
-      const all = [...rules, ...(yield* savedRules())]
-      const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
-      const effect: Permission.Effect = effects.includes("ask") ? "ask" : "allow"
-      const event = yield* hooks.trigger("permission", "evaluate", {
-        sessionID: input.sessionID,
-        agent: input.agent,
-        action: input.action,
-        resources: input.resources,
-        metadata: input.metadata,
-        source: input.source,
-        effect,
+    const evaluateInput: (input: AssertInput) => Effect.Effect<Evaluation, SessionErrors.NotFoundError> =
+      Effect.fnUntraced(function* (input: AssertInput) {
+        const configuration = yield* configured(input.sessionID, input.agent)
+        const rules = configuration.rules
+        const agentID = configuration.agentID
+        if (denied(input, rules)) return { effect: "deny" as const, rules, agentID }
+        const all = [...rules, ...(yield* savedRules())]
+        const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
+        const effect: Permission.Effect = effects.includes("ask") ? "ask" : "allow"
+        const event = yield* hooks.trigger("permission", "evaluate", {
+          sessionID: input.sessionID,
+          agent: input.agent,
+          action: input.action,
+          resources: input.resources,
+          metadata: input.metadata,
+          source: input.source,
+          effect,
+        })
+        const unattended = yield* Unattended
+        if (event.effect !== "ask" || unattended === undefined)
+          return { effect: event.effect, message: event.message, rules: all, agentID }
+        const settled = [...all, ...unattended]
+        const allowed = input.resources.every(
+          (resource) => evaluate(input.action, resource, settled).effect === "allow",
+        )
+        if (allowed) return { effect: "allow" as const, rules: all, agentID }
+        return {
+          effect: "deny" as const,
+          message: `Permission ${input.action} needs approval, and nobody is present to give it`,
+          rules: all,
+          agentID,
+        }
       })
-      const unattended = yield* Unattended
-      if (event.effect !== "ask" || unattended === undefined)
-        return { effect: event.effect, message: event.message, rules: all }
-      const settled = [...all, ...unattended]
-      const allowed = input.resources.every((resource) => evaluate(input.action, resource, settled).effect === "allow")
-      if (allowed) return { effect: "allow" as const, rules: all }
-      return {
-        effect: "deny" as const,
-        message: `Permission ${input.action} needs approval, and nobody is present to give it`,
-        rules: all,
-      }
+
+    const decodeAuthority = Schema.decodeUnknownSync(AuthorityInput, { onExcessProperty: "error" })
+    const collectAuthorities = Effect.fnUntraced(function* (
+      input: AssertInput,
+      frame?: PermissionOperationContext.Frame,
+    ) {
+      const snapshot =
+        frame?.sessionID === input.sessionID
+          ? yield* PermissionOperationContext.read(frame.episode).pipe(
+              Effect.catchTag("Permission.InvalidEpisode", () => Effect.undefined),
+            )
+          : undefined
+      const principals = new Set<SessionSchema.ID>()
+      let open = true
+      yield* hooks
+        .trigger(
+          "permission",
+          "experimental.operation",
+          Object.freeze({
+            sessionID: input.sessionID,
+            source: input.source ? Object.freeze({ ...input.source }) : undefined,
+            kind: snapshot?.intent.kind ?? "unsupported",
+            phase: frame?.phase ?? "effect",
+            requireAuthority: (value: AuthorityInput) => {
+              if (!open) throw new Error("Expired authority collector")
+              principals.add(decodeAuthority(value).sessionID)
+            },
+          }),
+        )
+        .pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              open = false
+            }),
+          ),
+        )
+      return { authorities: Object.freeze([...principals]), frame: snapshot ? frame : undefined }
     })
 
-    function request(input: AssertInput, message?: string): Request {
+    const evaluateRaw = Effect.fnUntraced(function* (input: AssertInput) {
+      const result = yield* evaluateInput(input)
+      if (result.effect === "deny") return result
+      const collected = yield* collectAuthorities(input)
+      if (collected.authorities.length === 0) return result
+      return { ...result, effect: "deny" as const, message: "Native operation projection required" }
+    })
+
+    function request(input: AssertInput, message?: string, delegation?: Permission.Delegation): Request {
       return {
         id: input.id ?? ID.create(),
         sessionID: input.sessionID,
@@ -223,6 +298,7 @@ const layer = Layer.effect(
           Object.fromEntries(Object.entries(input.metadata).filter(([, value]) => value !== undefined)),
         source: input.source,
         message,
+        ...(delegation ? { experimental: { delegation } } : {}),
       }
     }
 
@@ -247,48 +323,153 @@ const layer = Layer.effect(
 
     const ask = Effect.fn("Permission.ask")(function* (input: AssertInput) {
       if (closed) return { id: input.id ?? ID.create(), effect: "deny" as const }
-      const result = yield* evaluateInput(input)
+      const result = yield* evaluateRaw(input)
       const value = request(input, result.message)
       if (result.effect === "ask") yield* create(value, input.agent)
       return { id: value.id, effect: result.effect }
     })
 
+    const settleInput = (
+      input: AssertInput,
+      result: Effect.Success<ReturnType<typeof evaluateInput>>,
+      delegation?: Permission.Delegation,
+    ) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          if (result.effect === "deny") {
+            return yield* new BlockedError({
+              rules: relevant(input, result.rules),
+              permission: input.action,
+              resources: input.resources,
+              reason: result.message,
+            })
+          }
+          if (result.effect === "allow") return
+          const item = yield* create(request(input, result.message, delegation), input.agent)
+          return yield* restore(Deferred.await(item.deferred)).pipe(
+            // Deliberate defect tunnel: leaves wrap execution in blanket `mapError`, which
+            // must not convert a user's decline into model-facing tool output. The decline
+            // resurfaces as a typed failure at SessionModelRequest.executeTool. A decline
+            // WITH feedback (CorrectedError) intentionally stays typed so the leaf can turn
+            // it into ToolFailure and the model continues.
+            Effect.catchTag("Permission.DeclinedError", (error) => Effect.die(error)),
+            Effect.ensuring(
+              Effect.sync(() => {
+                pending.delete(item.request.id)
+              }),
+            ),
+          )
+        }),
+      )
+
     const assert = Effect.fn("Permission.assert")((input: AssertInput) =>
       Effect.gen(function* () {
         if (closed) return yield* Effect.die(new DeclinedError())
-        const result = yield* evaluateInput(input)
-        return yield* Effect.uninterruptibleMask((restore) =>
-          Effect.gen(function* () {
-            if (result.effect === "deny") {
-              return yield* new BlockedError({
-                rules: relevant(input, result.rules),
-                permission: input.action,
-                resources: input.resources,
-                reason: result.message,
-              })
-            }
-            if (result.effect === "allow") return
-            const item = yield* create(request(input, result.message), input.agent)
-            return yield* restore(Deferred.await(item.deferred)).pipe(
-              // Deliberate defect tunnel: leaves wrap execution in blanket `mapError`, which
-              // must not convert a user's decline into model-facing tool output. The decline
-              // resurfaces as a typed failure at SessionModelRequest.executeTool. A decline
-              // WITH feedback (CorrectedError) intentionally stays typed so the leaf can turn
-              // it into ToolFailure and the model continues.
-              Effect.catchTag("Permission.DeclinedError", (error) => Effect.die(error)),
-              Effect.ensuring(
-                Effect.sync(() => {
-                  pending.delete(item.request.id)
-                }),
-              ),
-            )
-          }),
-        )
+        const result = yield* evaluateRaw(input)
+        return yield* settleInput(input, result)
       }),
     )
 
+    const decisions = new WeakMap<
+      Decision,
+      {
+        input: AssertInput
+        result: Effect.Success<ReturnType<typeof evaluateInput>>
+        authorities: readonly SessionSchema.ID[]
+        frame?: PermissionOperationContext.Frame
+      }
+    >()
+    const inspect = Effect.fn("Permission.inspect")(function* (input: AssertInput) {
+      const owned = {
+        ...input,
+        resources: Object.freeze([...input.resources]),
+        ...(input.save ? { save: Object.freeze([...input.save]) } : {}),
+        ...(input.source ? { source: Object.freeze({ ...input.source }) } : {}),
+      }
+      const result = closed
+        ? { effect: "deny" as const, rules: [], agentID: undefined, message: "Permission scope is closed" }
+        : yield* evaluateInput(owned)
+      const frame = yield* PermissionOperationContext.Current
+      const collected =
+        result.effect === "deny" ? { authorities: [], frame: undefined } : yield* collectAuthorities(owned, frame)
+      const evaluated =
+        collected.authorities.length > 0 && !collected.frame
+          ? { ...result, effect: "deny" as const, message: "Native operation projection required" }
+          : result
+      const generation = yield* hooks.generation
+      const payload = new TextEncoder().encode(
+        JSON.stringify({
+          rules: evaluated.rules,
+          agentID: "agentID" in evaluated ? evaluated.agentID : undefined,
+          generation,
+        }),
+      )
+      const bytes = yield* Effect.promise(() => crypto.subtle.digest("SHA-256", payload))
+      const revision = Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("")
+      const decision = Object.freeze({
+        effect: evaluated.effect,
+        message: evaluated.message,
+        authorities: collected.authorities,
+        revision,
+      })
+      decisions.set(decision, {
+        input: owned,
+        result: evaluated,
+        authorities: collected.authorities,
+        frame: collected.frame,
+      })
+      return decision
+    })
+    const settle = Effect.fn("Permission.settle")(function* (decision: Decision) {
+      const owned = decisions.get(decision)
+      if (!owned || closed)
+        return yield* new BlockedError({
+          rules: [],
+          permission: owned?.input.action ?? "unknown",
+          resources: owned?.input.resources ?? [],
+          reason: "Permission decision is unowned, consumed, or closed",
+        })
+      if (owned.frame) {
+        const active = yield* PermissionOperationContext.read(owned.frame.episode).pipe(
+          Effect.catchTag("Permission.InvalidEpisode", () => Effect.undefined),
+        )
+        const authorization = yield* PermissionOperationContext.Authorized
+        if (
+          !active ||
+          (owned.result.effect !== "deny" &&
+            owned.authorities.length > 0 &&
+            (!authorization ||
+              authorization.episode !== owned.frame.episode ||
+              authorization.sessionID !== owned.input.sessionID ||
+              !owned.authorities.every((principal) => authorization.authorities.includes(principal))))
+        )
+          return yield* new BlockedError({
+            rules: [],
+            permission: owned.input.action,
+            resources: owned.input.resources,
+            reason: "Additional native authorities are not satisfied",
+          })
+      }
+      decisions.delete(decision)
+      const snapshot = owned.frame
+        ? yield* PermissionOperationContext.read(owned.frame.episode).pipe(
+            Effect.catchTag("Permission.InvalidEpisode", () => Effect.undefined),
+          )
+        : undefined
+      const delegation: Permission.Delegation | undefined =
+        snapshot && owned.frame?.targetDirectory && snapshot.invocation.sessionID !== owned.input.sessionID
+          ? {
+              operationID: snapshot.id,
+              targetSessionID: snapshot.invocation.sessionID,
+              targetDirectory: owned.frame.targetDirectory,
+              source: { type: "tool", messageID: snapshot.invocation.messageID, id: snapshot.invocation.id },
+            }
+          : undefined
+      return yield* settleInput(owned.input, owned.result, delegation)
+    })
+
     const assertNotDenied = Effect.fn("Permission.assertNotDenied")(function* (input: AssertInput) {
-      const result = yield* evaluateInput(input)
+      const result = yield* evaluateRaw(input)
       if (result.effect !== "deny") return
       return yield* new BlockedError({
         rules: relevant(input, result.rules),
@@ -300,7 +481,7 @@ const layer = Layer.effect(
 
     const allows = Effect.fn("Permission.allows")(function* (input: AssertInput) {
       if (closed) return false
-      return (yield* evaluateInput(input)).effect === "allow"
+      return (yield* evaluateRaw(input)).effect === "allow"
     })
 
     const reply = Effect.fn("Permission.reply")((input: ReplyInput) =>
@@ -377,7 +558,28 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.request).filter((request) => request.sessionID === sessionID)
     })
 
-    return Service.of({ ask, assert, assertNotDenied, allows, reply, get, forSession, list, close })
+    const collect = Effect.fn("Permission.collect")(function* (input: AssertInput) {
+      const frame = yield* PermissionOperationContext.Current
+      return (yield* collectAuthorities(input, frame)).authorities
+    })
+    const configuredDenies = Effect.fn("Permission.configuredDenies")(function* (input: AssertInput) {
+      return denied(input, (yield* configured(input.sessionID, input.agent)).rules)
+    })
+    return Service.of({
+      ask,
+      assert,
+      assertNotDenied,
+      allows,
+      reply,
+      get,
+      forSession,
+      list,
+      close,
+      inspect,
+      settle,
+      collect,
+      configuredDenies,
+    })
   }),
 )
 

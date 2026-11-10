@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Deferred, Effect, Fiber, Layer, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { Agent } from "@opencode/core/agent"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -9,6 +9,7 @@ import { Location } from "@opencode/core/location"
 import { Permission } from "@opencode/core/permission"
 import { PermissionTable } from "@opencode/core/permission/sql"
 import { PermissionSaved } from "@opencode/core/permission/saved"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
@@ -26,7 +27,15 @@ const current = Layer.succeed(
 )
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, PermissionSaved.node, Agent.node, Permission.node]),
+    LayerNode.group([
+      Database.node,
+      Bus.node,
+      SessionStore.node,
+      PermissionSaved.node,
+      Agent.node,
+      Permission.node,
+      PluginHooks.node,
+    ]),
     [Location.node.replace(current)],
   ),
 )
@@ -98,6 +107,133 @@ function waitForRequest(input: Partial<Permission.AssertInput> = {}) {
 }
 
 describe("Permission", () => {
+  it.effect("decision revision follows native rules and hook registrations", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "read", resource: "*", effect: "allow" }])
+      const service = yield* Permission.Service
+      const hooks = yield* PluginHooks.Service
+      const first = yield* service.inspect(assertion())
+      expect((yield* service.inspect(assertion())).revision).toBe(first.revision)
+      yield* setRules([{ action: "read", resource: "src/**", effect: "allow" }])
+      const changed = yield* service.inspect(assertion())
+      expect(changed.effect).toBe("allow")
+      expect(changed.revision).not.toBe(first.revision)
+      const registration = yield* hooks.register("permission", "evaluate", () => Effect.void)
+      const registered = yield* service.inspect(assertion())
+      expect(registered.revision).not.toBe(changed.revision)
+      yield* registration.dispose
+      expect((yield* service.inspect(assertion())).revision).not.toBe(registered.revision)
+    }),
+  )
+
+  it.effect("inspection and settlement do not evaluate existing native hooks twice", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "read", resource: "*", effect: "allow" }])
+      const service = yield* Permission.Service
+      const hooks = yield* PluginHooks.Service
+      let calls = 0
+      yield* hooks.register("permission", "evaluate", () =>
+        Effect.sync(() => {
+          calls++
+        }),
+      )
+      const decision = yield* service.inspect(assertion())
+      yield* service.settle(decision)
+      expect(calls).toBe(1)
+      yield* service.assert(assertion())
+      expect(calls).toBe(2)
+    }),
+  )
+
+  it.effect("inspection captures resource strings before mutable producer changes", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const service = yield* Permission.Service
+      const resources = ["src/original.ts"]
+      const decision = yield* service.inspect(assertion({ resources }))
+      resources[0] = "src/other.ts"
+      const fiber = yield* service.settle(decision).pipe(Effect.forkScoped)
+      yield* Effect.yieldNow
+      expect((yield* service.list())[0].resources).toEqual(["src/original.ts"])
+      yield* service.reply({ requestID: Permission.ID.create("per_test"), reply: "once" })
+      yield* Fiber.join(fiber)
+    }),
+  )
+
+  it.effect("inspects an ask without queuing a pending native request", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const service = yield* Permission.Service
+      expect((yield* service.inspect(assertion())).effect).toBe("ask")
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("settles the inspected native ask only after its own reply", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const service = yield* Permission.Service
+      const decision = yield* service.inspect(assertion())
+      const fiber = yield* service.settle(decision).pipe(Effect.forkScoped)
+      yield* Effect.yieldNow
+      expect(yield* service.list()).toHaveLength(1)
+      yield* service.reply({ requestID: Permission.ID.create("per_test"), reply: "once" })
+      yield* Fiber.join(fiber)
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("inspected native deny remains final without an approval request", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "read", resource: "*", effect: "deny" }])
+      const service = yield* Permission.Service
+      const decision = yield* service.inspect(assertion())
+      expect(decision.effect).toBe("deny")
+      expect(yield* service.settle(decision).pipe(Effect.flip)).toBeInstanceOf(Permission.BlockedError)
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("copied and already consumed decisions cannot authorize native work", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "read", resource: "*", effect: "allow" }])
+      const service = yield* Permission.Service
+      const decision = yield* service.inspect(assertion())
+      expect(yield* service.settle({ ...decision }).pipe(Effect.flip)).toBeInstanceOf(Permission.BlockedError)
+      yield* service.settle(decision)
+      expect(yield* service.settle(decision).pipe(Effect.flip)).toBeInstanceOf(Permission.BlockedError)
+    }),
+  )
+
+  it.effect("closed permission scope cannot settle a formerly allowed decision", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "read", resource: "*", effect: "allow" }])
+      const service = yield* Permission.Service
+      const decision = yield* service.inspect(assertion())
+      yield* service.close
+      expect(yield* service.settle(decision).pipe(Effect.flip)).toBeInstanceOf(Permission.BlockedError)
+    }),
+  )
+
+  it.effect("inspected settlement preserves native plain-decline defect", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const service = yield* Permission.Service
+      const decision = yield* service.inspect(assertion())
+      const fiber = yield* service.settle(decision).pipe(Effect.forkScoped)
+      yield* Effect.yieldNow
+      yield* service.reply({ requestID: Permission.ID.create("per_test"), reply: "reject" })
+      const exit = yield* Fiber.await(fiber)
+      expect(
+        Exit.isFailure(exit) &&
+          exit.cause.reasons.some(
+            (reason) => Cause.isDieReason(reason) && reason.defect instanceof Permission.DeclinedError,
+          ),
+      ).toBe(true)
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
   it.effect("returns the evaluated effect and only queues prompts", () =>
     Effect.gen(function* () {
       yield* setup([{ action: "read", resource: "*", effect: "allow" }])
@@ -764,10 +900,7 @@ describe("shell scanner permission impact", () => {
       name: "assignment redirect prefix",
       shell: "bash",
       command: "FOO=bar > output; printf done",
-      grants: [
-        ["printf *"],
-        ["FOO=bar > *", "printf *"],
-      ],
+      grants: [["printf *"], ["FOO=bar > *", "printf *"]],
       repeat: [
         ["ask", "allow"],
         ["ask", "allow"],
@@ -779,10 +912,7 @@ describe("shell scanner permission impact", () => {
       name: "PowerShell method prefix",
       shell: "pwsh",
       command: '[IO.File]::Delete("C:\\first")',
-      grants: [
-        ["[IO.File]::Delete(*"],
-        ["[IO.File]::Delete(*"],
-      ],
+      grants: [["[IO.File]::Delete(*"], ["[IO.File]::Delete(*"]],
       repeat: [
         ["allow", "allow"],
         ["allow", "allow"],

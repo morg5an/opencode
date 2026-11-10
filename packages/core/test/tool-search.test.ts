@@ -10,6 +10,7 @@ import { FileSystem } from "@opencode/core/filesystem"
 import { Location } from "@opencode/core/location"
 import { FileAccess } from "@opencode/core/file-access"
 import { Permission } from "@opencode/core/permission"
+import { PermissionOperation } from "@opencode/core/permission/operation"
 import { Ripgrep } from "@opencode/core/ripgrep"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
@@ -25,12 +26,28 @@ import { executeTool, registerToolPlugin, toolIdentity } from "./lib/tool"
 const globToolNode = makeLocationNode({
   name: "test/glob-tool-plugin",
   layer: Layer.effectDiscard(registerToolPlugin(GlobTool.Plugin)),
-  deps: [Tool.node, Environment.node, Ripgrep.node, Location.node, FileAccess.node, Permission.node],
+  deps: [
+    Tool.node,
+    Environment.node,
+    Ripgrep.node,
+    Location.node,
+    FileAccess.node,
+    Permission.node,
+    PermissionOperation.node,
+  ],
 })
 const grepToolNode = makeLocationNode({
   name: "test/grep-tool-plugin",
   layer: Layer.effectDiscard(registerToolPlugin(GrepTool.Plugin)),
-  deps: [Tool.node, Environment.node, Ripgrep.node, Location.node, FileAccess.node, Permission.node],
+  deps: [
+    Tool.node,
+    Environment.node,
+    Ripgrep.node,
+    Location.node,
+    FileAccess.node,
+    Permission.node,
+    PermissionOperation.node,
+  ],
 })
 const sessionID = Session.ID.make("ses_search_tool_test")
 

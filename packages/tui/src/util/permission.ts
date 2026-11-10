@@ -1,7 +1,20 @@
 import { Locale } from "./locale"
+import type { PermissionRequest } from "@opencode/client"
 import { canonicalToolName, finiteNumber, webSearchProviderLabel } from "./tool-display"
 
 type Dict = Record<string, unknown>
+
+export function permissionDelegationLines(request: Pick<PermissionRequest, "sessionID" | "experimental">): string[] {
+  const origin = request.experimental?.delegation
+  if (!origin) return []
+  return [
+    "Delegated operation",
+    `Approval: ${request.sessionID}`,
+    `Target: ${origin.targetSessionID}`,
+    `Directory: ${origin.targetDirectory}`,
+    ...(origin.source ? [`Source: ${origin.source.messageID} / ${origin.source.id}`] : []),
+  ]
+}
 
 export type PermissionPresentation = {
   icon: string

@@ -40,6 +40,7 @@ const eventProviderID = (event: unknown) => {
 }
 
 export interface Interface {
+  readonly generation: Effect.Effect<number>
   readonly has: <Domain extends keyof Domains>(
     domain: Domain,
     name: keyof Domains[Domain] & keyof Failures[Domain],
@@ -64,6 +65,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const callbacks = new Map<string, Entry[]>()
+    let generation = 0
     const key = (domain: keyof Domains, name: PropertyKey) => `${domain}.${String(name)}`
 
     const register: Interface["register"] = Effect.fn("PluginHooks.register")(
@@ -73,9 +75,11 @@ const layer = Layer.effect(
         let active = true
         const entry = { callback, options }
         callbacks.set(id, [...(callbacks.get(id) ?? []), entry])
+        generation++
         const dispose = Effect.sync(() => {
           if (!active) return
           active = false
+          generation++
           const next = (callbacks.get(id) ?? []).filter((item) => item !== entry)
           if (next.length === 0) callbacks.delete(id)
           else callbacks.set(id, next)
@@ -101,7 +105,7 @@ const layer = Layer.effect(
         ),
       )
 
-    return Service.of({ has, register, trigger })
+    return Service.of({ has, register, trigger, generation: Effect.sync(() => generation) })
   }),
 )
 

@@ -16,6 +16,10 @@ const asserted: Permission.AssertInput[] = []
 const permission = Layer.succeed(
   Permission.Service,
   Permission.Service.of({
+    collect: () => Effect.die(new Error("collect is outside assertion adapter fixture")),
+    configuredDenies: () => Effect.die(new Error("configuredDenies is outside assertion adapter fixture")),
+    inspect: () => Effect.die(new Error("inspect is outside assertion adapter fixture")),
+    settle: () => Effect.die(new Error("settle is outside assertion adapter fixture")),
     close: Effect.void,
     ask: (input) => Effect.succeed({ id: input.id ?? Permission.ID.create(), effect: "ask" }),
     assert: (input) => {

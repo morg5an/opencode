@@ -6,6 +6,7 @@ import { ephemeral, inventory } from "./event.js"
 import { ascending } from "./identifier.js"
 import { SessionID } from "./session-id.js"
 import { statics } from "./schema.js"
+import { AbsolutePath } from "./schema.js"
 
 export const ID = Schema.String.check(Schema.isStartingWith("per")).pipe(
   Schema.brand("Permission.ID"),
@@ -23,6 +24,18 @@ export const Source = Schema.Union([
 ]).annotate({ identifier: "Permission.Source" })
 export type Source = typeof Source.Type
 
+export const Delegation = Schema.Struct({
+  operationID: Schema.String,
+  targetSessionID: SessionID,
+  targetDirectory: AbsolutePath,
+  source: Source.pipe(optional),
+}).annotate({
+  identifier: "Permission.Delegation",
+  description:
+    "Experimental: native delegated operation origin; output only. May change without compatibility guarantees.",
+})
+export type Delegation = typeof Delegation.Type
+
 const RequestFields = {
   sessionID: SessionID,
   action: Schema.String,
@@ -36,6 +49,7 @@ const RequestFields = {
 export const Request = Schema.Struct({
   id: ID,
   ...RequestFields,
+  experimental: Schema.Struct({ delegation: Delegation.pipe(optional) }).pipe(optional),
 }).annotate({ identifier: "Permission.Request" })
 export interface Request extends Schema.Schema.Type<typeof Request> {}
 

@@ -14,6 +14,7 @@ import { Skill } from "../../skill.js"
 import { SkillDiscovery } from "../../skill/discovery.js"
 import { ReadToolFileSystem } from "../read-filesystem.js"
 import { Environment } from "../../environment/index.js"
+import { PermissionOperation } from "../../permission/operation.js"
 
 export const name = "read"
 const FILENAME = "AGENTS.md"
@@ -37,6 +38,7 @@ export const Plugin = {
     const access = yield* FileAccess.Service
     const permission = yield* Permission.Service
     const skills = yield* Skill.Service
+    const operations = yield* PermissionOperation.Service
     const sessionInstructions = yield* SessionInstructions.Service
     const fs = yield* FSUtil.Service
     const location = yield* Location.Service
@@ -93,13 +95,30 @@ export const Plugin = {
                 return { output, path: input.path }
               }
 
+              const authorize = (file: string, options?: FileAccess.ReadOptions) =>
+                Effect.gen(function* () {
+                  if (!(yield* operations.enabled)) return yield* access.authorizeRead(file, context, options)
+                  const target = yield* access.resolve({ path: file, kind: options ? "file" : undefined })
+                  const episode = yield* operations.prepare(
+                    {
+                      kind: "file-path",
+                      action: "read",
+                      targets: [{ absolute: target.absolute, ...(options ? { kind: "file" as const } : {}) }],
+                    },
+                    context,
+                  )
+                  if (!episode) return yield* access.authorizeRead(file, context, options)
+                  yield* operations.authorizeBoundary(episode)
+                  yield* operations.authorizeEffect(episode)
+                  return target
+                })
               const read = (target: FileAccess.Target) =>
                 reader.read(target.absolute, target.resource, {
                   offset: input.offset,
                   limit: input.limit,
                 })
 
-              const requested = yield* access.authorizeRead(input.path, context)
+              const requested = yield* authorize(input.path)
               const result = yield* read(requested).pipe(
                 Effect.map((content) => ({ content, target: requested, path: input.path })),
                 Effect.catchIf(
@@ -110,7 +129,7 @@ export const Plugin = {
                         Effect.orElseSucceed(() => undefined),
                       )
                       if (!alternate) return yield* missing({ input: input.path, requested, context })
-                      const target = yield* access.authorizeRead(alternate, context, { siblingOf: requested })
+                      const target = yield* authorize(alternate, { siblingOf: requested })
                       const content = yield* read(target).pipe(
                         Effect.catchIf(
                           (error) => error instanceof Environment.NotFound,
@@ -154,6 +173,7 @@ export const Plugin = {
               )
               return { output: result.content, path: result.path }
             }).pipe(
+              Effect.scoped,
               Effect.map((result) => ({
                 output: result.output,
                 content: toModelContent(result.path, input.offset, result.output),

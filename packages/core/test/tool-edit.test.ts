@@ -11,6 +11,7 @@ import { Formatter } from "@opencode/core/formatter"
 import { Location } from "@opencode/core/location"
 import { FileAccess } from "@opencode/core/file-access"
 import { Permission } from "@opencode/core/permission"
+import { PermissionOperation } from "@opencode/core/permission/operation"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
 import { Tool } from "@opencode/core/tool"
@@ -26,7 +27,16 @@ import { toolIdentity, executeTool, registerToolPlugin, toolDefinitions } from "
 const editToolNode = makeLocationNode({
   name: "test/edit-tool-plugin",
   layer: Layer.effectDiscard(registerToolPlugin(EditTool.Plugin)),
-  deps: [Tool.node, FileWrite.node, FileMutation.node, Environment.node, Location.node, Permission.node],
+  deps: [
+    Tool.node,
+    FileAccess.node,
+    FileWrite.node,
+    FileMutation.node,
+    Environment.node,
+    Location.node,
+    Permission.node,
+    PermissionOperation.node,
+  ],
 })
 
 const sessionID = Session.ID.make("ses_edit_tool_test")
@@ -694,7 +704,10 @@ describe("EditTool", () => {
       // A CRLF file with a block pasted in from an LF editor, edited with surrounding context.
       const target = path.join(tmp.path, "store.cs")
       return Effect.promise(() =>
-        fs.writeFile(target, "All(item.Sku);\r\n\r\nFind(sku);\r\n\r\nvoid Add()\n{\n  _items[item.Sku] = item;\n}\r\n"),
+        fs.writeFile(
+          target,
+          "All(item.Sku);\r\n\r\nFind(sku);\r\n\r\nvoid Add()\n{\n  _items[item.Sku] = item;\n}\r\n",
+        ),
       ).pipe(
         Effect.andThen(
           withTool(tmp.path, edit, (registry) =>
@@ -738,7 +751,10 @@ describe("EditTool", () => {
           withTool(tmp.path, edit, (registry) =>
             Effect.gen(function* () {
               expect(
-                yield* executeTool(registry, call({ path: "strip.sh", oldString: "\r", newString: "", replaceAll: true })),
+                yield* executeTool(
+                  registry,
+                  call({ path: "strip.sh", oldString: "\r", newString: "", replaceAll: true }),
+                ),
               ).toMatchObject({ status: "completed", output: { replacements: 2 } })
               expect(
                 yield* executeTool(registry, call({ path: "whole.sh", oldString: "x\r\ny\r\n", newString: "x\ny\n" })),
@@ -778,7 +794,10 @@ describe("EditTool", () => {
             Effect.gen(function* () {
               // The typography tier matches the curly quote, and the replacement writes the same bytes back.
               expect(
-                yield* executeTool(registry, call({ path: "quote.txt", oldString: "it's here", newString: "it’s here" })),
+                yield* executeTool(
+                  registry,
+                  call({ path: "quote.txt", oldString: "it's here", newString: "it’s here" }),
+                ),
               ).toEqual({
                 status: "error",
                 error: {

@@ -17,6 +17,7 @@ import { Location } from "../../location.js"
 import { FileAccess } from "../../file-access.js"
 import { FileWrite } from "../../file-write.js"
 import { Permission } from "../../permission.js"
+import { PermissionOperation } from "../../permission/operation.js"
 import { fileDiff } from "./file-diff.js"
 
 export const name = "edit"
@@ -121,7 +122,9 @@ const withRegionEndings = (region: string, replacement: string, fallback: string
   const after = replacement.split("\n")
   const key = (line: string) => normalizeForMatch(line.trimEnd())
   const source = alignLines(before.map(key), after.map(key))
-  return after.map((line, index) => (index === after.length - 1 ? line : line + (endings[source[index]!] ?? fallback))).join("")
+  return after
+    .map((line, index) => (index === after.length - 1 ? line : line + (endings[source[index]!] ?? fallback)))
+    .join("")
 }
 
 /**
@@ -260,11 +263,13 @@ const countBefore = (positions: number[], offset: number) => {
 export const Plugin = {
   id: "opencode.tool.edit",
   effect: Effect.fn("EditTool.Plugin")(function* (ctx: Context) {
+    const access = yield* FileAccess.Service
     const fileMutation = yield* FileMutation.Service
     const fileWrite = yield* FileWrite.Service
     const environment = yield* Environment.Service
     const location = yield* Location.Service
     const permission = yield* Permission.Service
+    const operations = yield* PermissionOperation.Service
 
     yield* ctx.tool
       .transform((editor) =>
@@ -288,7 +293,13 @@ export const Plugin = {
                 })
               }
 
-              const target = yield* fileWrite.target(input.path, context)
+              const target = yield* access.resolve({ path: input.path, kind: "file" })
+              const episode = yield* operations.prepare(
+                { kind: "file-path", action: "edit", targets: [{ absolute: target.absolute, kind: "file" }] },
+                context,
+              )
+              if (episode) yield* operations.authorizeBoundary(episode)
+              else yield* access.authorizeExternal([target], context)
 
               const original = yield* FileMutation.readText(environment.files, target.absolute).pipe(
                 Effect.catchTag("Environment.NotFound", () =>
@@ -318,15 +329,35 @@ export const Plugin = {
                 replacements > 0 && (replacements === 1 || input.replaceAll === true)
                   ? fileDiff(target.resource, source, replaced)
                   : undefined
-              yield* fileWrite.authorize(target, context, preview)
+              if (episode)
+                yield* operations.authorizeEffectProjected(episode, (projection) => {
+                  const projected = projection.targets[0]
+                  if (!projected) throw new Error("Edit preview is outside native operation")
+                  return preview ? { files: [fileDiff(projected.resource, source, replaced)] } : undefined
+                })
+              else yield* fileWrite.authorize(target, context, preview)
               if (replacements === 0) {
                 // The hint shows file contents, so only when reading this file is already allowed.
-                const readable = yield* permission.allows({
-                  action: "read",
-                  resources: [target.resource],
-                  save: ["*"],
-                  ...Permission.invocation(context),
-                })
+                const readable = yield* episode
+                  ? Effect.gen(function* () {
+                      const readEpisode = yield* operations.prepare(
+                        { kind: "file-path", action: "read", targets: [{ absolute: target.absolute, kind: "file" }] },
+                        context,
+                      )
+                      if (!readEpisode) return false
+                      yield* operations.authorizeBoundary(readEpisode)
+                      yield* operations.authorizeEffect(readEpisode)
+                      return true
+                    }).pipe(
+                      Effect.provideService(Permission.Unattended, []),
+                      Effect.catchTag("Permission.BlockedError", () => Effect.succeed(false)),
+                    )
+                  : permission.allows({
+                      action: "read",
+                      resources: [target.resource],
+                      save: ["*"],
+                      ...Permission.invocation(context),
+                    })
                 const hint = readable ? missHint(source, input.oldString, input.newString) : undefined
                 return yield* new ToolFailure({
                   message: `Could not find oldString in ${input.path}. It must match exactly, including whitespace and indentation.${hint ? `\n\n${hint}` : ""}`,
@@ -353,6 +384,7 @@ export const Plugin = {
               } satisfies Output
             }).pipe(
               fileMutation.withLock([FileAccess.resolvePath(location.directory, input.path)]),
+              Effect.scoped,
               Effect.map((output) => ({
                 output,
                 content: `Edited ${output.files[0]?.file} (${output.replacements} replacement${output.replacements === 1 ? "" : "s"})`,

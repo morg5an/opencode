@@ -29,6 +29,7 @@ import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionStore } from "@opencode/core/session/store"
 import { Permission } from "@opencode/core/permission"
+import { PermissionOperation } from "@opencode/core/permission/operation"
 import { PermissionSaved } from "@opencode/core/permission/saved"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
@@ -135,6 +136,7 @@ const shellPluginSupervisor = makeLocationNode({
     Environment.node,
     FileAccess.node,
     Permission.node,
+    PermissionOperation.node,
     Session.node,
     Job.node,
     Shell.node,
@@ -1180,6 +1182,7 @@ describe("ShellTool", () => {
             Environment.node,
             FileAccess.node,
             Permission.node,
+            PermissionOperation.node,
             Session.node,
             Job.node,
             Shell.node,

@@ -10,6 +10,7 @@ import { FSUtil } from "@opencode/util/fs-util"
 import { Location } from "@opencode/core/location"
 import { Image } from "@opencode/core/image"
 import { Permission } from "@opencode/core/permission"
+import { PermissionOperation } from "@opencode/core/permission/operation"
 import { Session } from "@opencode/core/session"
 import { Skill } from "@opencode/core/skill"
 import { AbsolutePath, RelativePath } from "@opencode/core/schema"
@@ -37,6 +38,7 @@ const readToolNode = makeLocationNode({
     FileAccess.node,
     Image.node,
     Permission.node,
+    PermissionOperation.node,
     SessionInstructions.node,
     Skill.node,
     FSUtil.node,
@@ -837,9 +839,10 @@ describe("ReadTool", () => {
         )
         expect(yield* readMissing(tmp.path, "short/ui.ts")).toBe("File not found: short/ui.ts")
         // Case-insensitive filesystems, such as macOS by default, simply read the file.
-        expect([undefined, `File not found: case/readme.md\n\nDid you mean one of these?\n${path.join("case", "README.md")}`]).toContain(
-          yield* readMissing(tmp.path, "case/readme.md"),
-        )
+        expect([
+          undefined,
+          `File not found: case/readme.md\n\nDid you mean one of these?\n${path.join("case", "README.md")}`,
+        ]).toContain(yield* readMissing(tmp.path, "case/readme.md"))
       }),
     ),
   )

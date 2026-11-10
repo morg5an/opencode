@@ -10,6 +10,7 @@ import { Environment } from "../../environment/index.js"
 import { Job } from "../../job.js"
 import { FileAccess } from "../../file-access.js"
 import { Permission } from "../../permission.js"
+import { PermissionOperation } from "../../permission/operation.js"
 import { NonNegativeInt } from "../../schema.js"
 import { Session } from "../../session.js"
 import { SessionSchema } from "../../session/schema.js"
@@ -110,26 +111,62 @@ export const Plugin = {
     const shellSelect = yield* ShellSelect.Service
     const compatibleShell = shellSelect.resolve({ priority: "compat" })
     const permission = yield* Permission.Service
+    const operations = yield* PermissionOperation.Service
 
     const prepare = Effect.fn("ShellTool.prepare")(function* (invocation: ShellCreateBefore, context: Tool.Context) {
       const target = yield* access.resolve({ path: invocation.cwd, kind: "directory" })
       invocation.cwd = target.absolute
       const timeout = invocation.timeout
-      const parsed = yield* ShellParse.scan(invocation.command, invocation.shell, target.absolute)
+      const captured = {
+        command: invocation.command,
+        cwd: target.absolute,
+        shell: invocation.shell,
+        env: { ...invocation.env },
+      }
+      const parsed = yield* ShellParse.scan(captured.command, captured.shell, captured.cwd)
       const directories = yield* Effect.forEach(parsed.directories, (directory) =>
         access.resolve({
           path: FileAccess.resolvePath(target.absolute, directory),
           kind: "directory",
         }),
       )
-      yield* access.authorizeExternal([target, ...directories], context)
-      if (parsed.commands.length > 0)
-        yield* permission.assert({
-          action: name,
-          resources: parsed.commands.map((command) => command.resource),
-          save: parsed.commands.map((command) => command.save),
-          ...Permission.invocation(context),
-        })
+      const episode = yield* operations.prepare(
+        {
+          kind: "shell",
+          ...captured,
+          directories: directories.map((directory) => directory.absolute),
+          commands: parsed.commands,
+        },
+        context,
+      )
+      if (episode) {
+        if (
+          invocation.command !== captured.command ||
+          invocation.cwd !== captured.cwd ||
+          invocation.shell !== captured.shell ||
+          invocation.timeout !== timeout ||
+          JSON.stringify(invocation.env) !== JSON.stringify(captured.env)
+        )
+          return yield* new Permission.BlockedError({
+            rules: [],
+            permission: "shell",
+            resources: [],
+            reason: "Shell invocation changed during native preparation",
+          })
+        invocation.env = Object.freeze({ ...captured.env })
+        Object.freeze(invocation)
+        yield* operations.authorizeBoundary(episode)
+        yield* operations.authorizeEffect(episode)
+      } else {
+        yield* access.authorizeExternal([target, ...directories], context)
+        if (parsed.commands.length > 0)
+          yield* permission.assert({
+            action: name,
+            resources: parsed.commands.map((command) => command.resource),
+            save: parsed.commands.map((command) => command.save),
+            ...Permission.invocation(context),
+          })
+      }
       // Approval can outlive the directory, so validate immediately before spawning.
       const workdir = yield* Environment.typeFollowing(environment.files, target.absolute).pipe(
         Effect.catchTag("Environment.NotFound", () =>
@@ -252,6 +289,7 @@ export const Plugin = {
 
               return yield* Deferred.await(settled)
             }).pipe(
+              Effect.scoped,
               // Shell spans, including the job that waits for a backgrounded command, name the call that started them.
               Effect.annotateSpans({
                 "gen_ai.tool.call.id": context.id,

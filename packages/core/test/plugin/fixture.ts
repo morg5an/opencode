@@ -76,6 +76,10 @@ const configLayer = Config.testLayer()
 const permissionLayer = Layer.succeed(
   Permission.Service,
   Permission.Service.of({
+    collect: () => Effect.die(new Error("collect is outside plugin fixture")),
+    configuredDenies: () => Effect.die(new Error("configuredDenies is outside plugin fixture")),
+    inspect: () => Effect.die(new Error("inspect is outside plugin fixture")),
+    settle: () => Effect.die(new Error("settle is outside plugin fixture")),
     close: Effect.void,
     ask: (input) => Effect.succeed({ id: input.id ?? Permission.ID.create(), effect: "ask" }),
     assert: () => Effect.void,

@@ -14,6 +14,7 @@ import { Location } from "../../location.js"
 import { FileAccess } from "../../file-access.js"
 import { Patch } from "@opencode/util/patch"
 import { Permission } from "../../permission.js"
+import { PermissionOperation } from "../../permission/operation.js"
 import DESCRIPTION from "../patch.txt"
 import { fileDiff } from "./file-diff.js"
 
@@ -74,6 +75,7 @@ export const Plugin = {
     const formatter = yield* Formatter.Service
     const location = yield* Location.Service
     const permission = yield* Permission.Service
+    const operations = yield* PermissionOperation.Service
 
     yield* ctx.tool
       .transform((editor) =>
@@ -108,11 +110,31 @@ export const Plugin = {
               if (hunks.length === 0) {
                 return yield* new ToolFailure({ message: "patch rejected: empty patch" })
               }
+              let episode: PermissionOperation.Episode | undefined
+              if (yield* operations.enabled) {
+                const operationTargets = yield* Effect.forEach(
+                  hunks.flatMap((hunk) => [
+                    hunk.path,
+                    ...(hunk.type === "update" && hunk.movePath ? [hunk.movePath] : []),
+                  ]),
+                  (value) => access.resolve({ path: value, kind: "file" }),
+                )
+                episode = yield* operations.prepare(
+                  {
+                    kind: "file-path",
+                    action: "edit",
+                    boundaryHints: "per-file",
+                    targets: operationTargets.map((target) => ({ absolute: target.absolute, kind: "file" as const })),
+                  },
+                  context,
+                )
+                if (episode) yield* operations.authorizeBoundary(episode)
+              }
               const prepared: Prepared[] = []
               const updates = new Map<string, string | null>()
               const resolveTarget = Effect.fnUntraced(function* (value: string) {
                 const target = yield* access.resolve({ path: value, kind: "file" })
-                if (!target.externalDirectory) return target
+                if (!target.externalDirectory || episode) return target
                 yield* access.authorizeExternal([target], context, {
                   filepath: target.absolute,
                   parentDir: target.externalDirectory.directory,
@@ -198,9 +220,7 @@ export const Plugin = {
                   } else {
                     updates.set(target.absolute, next)
                   }
-                }).pipe(
-                  Effect.mapError(toolFailure(`Unable to prepare patch at ${hunk.path}`)),
-                )
+                }).pipe(Effect.mapError(toolFailure(`Unable to prepare patch at ${hunk.path}`)))
               }
 
               const patchFiles = prepared.map((change) => patchFile(change))
@@ -208,17 +228,41 @@ export const Plugin = {
                 change.target,
                 ...(change.type === "update" && change.moveTarget ? [change.moveTarget] : []),
               ])
-              yield* permission.assert({
-                action: "edit",
-                resources: [...new Set(targets.map((target) => target.resource))],
-                save: ["*"],
-                metadata: {
-                  filepath: targets.map((target) => target.resource).join(", "),
-                  diff: patchFiles.map((file) => `${file.patch}\n`).join(""),
-                  files: patchFiles,
-                },
-                ...Permission.invocation(context),
-              })
+              if (episode)
+                yield* operations.authorizeEffectProjected(episode, (projection) => {
+                  const projected = new Map(projection.targets.map((target) => [target.absolute, target]))
+                  const rebase = (target: FileAccess.Target) => {
+                    const result = projected.get(target.absolute)
+                    if (!result) throw new Error("Patch preview is outside native operation")
+                    return result
+                  }
+                  const files = prepared.map((change) =>
+                    change.type === "update"
+                      ? patchFile({
+                          ...change,
+                          target: rebase(change.target),
+                          ...(change.moveTarget ? { moveTarget: rebase(change.moveTarget) } : {}),
+                        })
+                      : patchFile({ ...change, target: rebase(change.target) }),
+                  )
+                  return {
+                    filepath: targets.map((target) => rebase(target).resource).join(", "),
+                    diff: files.map((file) => `${file.patch}\n`).join(""),
+                    files,
+                  }
+                })
+              else
+                yield* permission.assert({
+                  action: "edit",
+                  resources: [...new Set(targets.map((target) => target.resource))],
+                  save: ["*"],
+                  metadata: {
+                    filepath: targets.map((target) => target.resource).join(", "),
+                    diff: patchFiles.map((file) => `${file.patch}\n`).join(""),
+                    files: patchFiles,
+                  },
+                  ...Permission.invocation(context),
+                })
 
               yield* Effect.forEach(
                 prepared,
@@ -273,6 +317,7 @@ export const Plugin = {
               return { applied, files }
             }).pipe(
               fileMutation.withLock(lockTargets),
+              Effect.scoped,
               Effect.map((output) => ({
                 output,
                 content: toModelContent(output),

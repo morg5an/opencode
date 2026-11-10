@@ -60,6 +60,7 @@ import { ModelsDev } from "../models-dev.js"
 import { Mcp } from "../mcp/index.js"
 import { Npm } from "@opencode/util/npm"
 import { Permission } from "../permission.js"
+import { PermissionOperation } from "../permission/operation.js"
 import { Reference } from "../reference.js"
 import { WebSearch } from "../websearch.js"
 import { Ripgrep } from "../ripgrep.js"
@@ -154,6 +155,7 @@ const services = [
   Mcp.Service,
   Npm.Service,
   Permission.Service,
+  PermissionOperation.Service,
   Form.Service,
   ReadToolFileSystem.Service,
   Reference.Service,
@@ -215,6 +217,7 @@ export const requirements = LayerNode.group([
   Mcp.node,
   Npm.node,
   Permission.node,
+  PermissionOperation.node,
   Form.node,
   ReadToolFileSystem.node,
   Reference.node,
